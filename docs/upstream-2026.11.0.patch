@@ -1,0 +1,1205 @@
+diff -ruN a/esphome/components/usb_audio/microphone/__init__.py b/esphome/components/usb_audio/microphone/__init__.py
+--- a/esphome/components/usb_audio/microphone/__init__.py	2026-11-24 11:45:56
++++ b/esphome/components/usb_audio/microphone/__init__.py	2026-11-24 11:45:56
+@@ -20,6 +20,11 @@
+     "USBAudioMicrophone", microphone.Microphone, cg.Component
+ )
+ 
++CONF_HARDWARE_GAIN = "hardware_gain"
++
++# UAC 1.0 volume is a signed 16-bit value in 1/256 dB; 0x8000 is reserved for silence.
++HARDWARE_GAIN_LIMIT_DB = 32767 / 256
++
+ # Keep in sync with USBAudioMicrophone::READ_TIMEOUT_MS in usb_audio_microphone.h
+ READ_PERIOD_MS = 20
+ 
+@@ -35,6 +40,11 @@
+     microphone.MICROPHONE_SCHEMA.extend(stream_schema(16000, 1)).extend(
+         {
+             cv.GenerateID(): cv.declare_id(USBAudioMicrophone),
++            # Capture gain set on the device's Feature Unit, clamped to what the device supports.
++            cv.Optional(CONF_HARDWARE_GAIN): cv.All(
++                cv.decibel,
++                cv.float_range(min=-HARDWARE_GAIN_LIMIT_DB, max=HARDWARE_GAIN_LIMIT_DB),
++            ),
+         }
+     ),
+     set_stream_limits,
+@@ -54,3 +64,5 @@
+     hub = await cg.get_variable(config[CONF_USB_AUDIO_ID])
+     await cg.register_parented(var, hub)
+     cg.add(hub.register_microphone(var))
++    if (gain := config.get(CONF_HARDWARE_GAIN)) is not None:
++        cg.add(hub.set_microphone_hardware_gain(round(gain * 256)))
+diff -ruN a/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp b/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp
+--- a/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp	2026-11-24 11:45:56
++++ b/esphome/components/usb_audio/microphone/usb_audio_microphone.cpp	2026-11-24 11:45:56
+@@ -4,6 +4,8 @@
+ 
+ #include "esphome/core/log.h"
+ 
++#include "esphome/components/usb_audio/uac_control.h"
++
+ #include <algorithm>
+ #include <cinttypes>
+ 
+@@ -35,6 +37,10 @@
+                 "  Buffer size: %" PRIu32,
+                 this->audio_stream_info_.get_sample_rate(), this->audio_stream_info_.get_bits_per_sample(),
+                 this->audio_stream_info_.get_channels(), this->buffer_size_);
++  if (this->parent_->has_microphone_hardware_gain()) {
++    char gain_str[DB_STR_SIZE];
++    ESP_LOGCONFIG(TAG, "  Hardware gain: %s", format_db(this->parent_->get_microphone_hardware_gain(), gain_str));
++  }
+ }
+ 
+ void USBAudioMicrophone::loop() {
+diff -ruN a/esphome/components/usb_audio/number/__init__.py b/esphome/components/usb_audio/number/__init__.py
+--- a/esphome/components/usb_audio/number/__init__.py	1970-01-01 01:00:00
++++ b/esphome/components/usb_audio/number/__init__.py	2026-11-24 11:45:56
+@@ -0,0 +1,77 @@
++import esphome.codegen as cg
++from esphome.components import number
++import esphome.config_validation as cv
++from esphome.const import (
++    CONF_MAX_VALUE,
++    CONF_MIN_VALUE,
++    CONF_RESTORE_VALUE,
++    CONF_STEP,
++    ENTITY_CATEGORY_CONFIG,
++    UNIT_DECIBEL,
++)
++from esphome.types import ConfigType
++
++from .. import (
++    CONF_USB_AUDIO_ID,
++    USBAudioComponent,
++    final_validate_one_per_hub,
++    usb_audio_ns,
++)
++
++DEPENDENCIES = ["usb_audio"]
++
++USBAudioGainNumber = usb_audio_ns.class_(
++    "USBAudioGainNumber", number.Number, cg.Component
++)
++
++# UAC 1.0 volume is a signed 16-bit value in 1/256 dB.
++GAIN_LIMIT_DB = 32767 / 256
++
++
++def _validate_range(config: ConfigType) -> ConfigType:
++    if config[CONF_MIN_VALUE] >= config[CONF_MAX_VALUE]:
++        raise cv.Invalid("min_value must be below max_value")
++    return config
++
++
++CONFIG_SCHEMA = cv.All(
++    number.number_schema(
++        USBAudioGainNumber,
++        unit_of_measurement=UNIT_DECIBEL,
++        entity_category=ENTITY_CATEGORY_CONFIG,
++        icon="mdi:knob",
++    )
++    .extend(
++        {
++            cv.GenerateID(CONF_USB_AUDIO_ID): cv.use_id(USBAudioComponent),
++            # The range and step until the device reports its own when it connects.
++            cv.Optional(CONF_MIN_VALUE, default=-30.0): cv.float_range(
++                min=-GAIN_LIMIT_DB, max=GAIN_LIMIT_DB
++            ),
++            cv.Optional(CONF_MAX_VALUE, default=30.0): cv.float_range(
++                min=-GAIN_LIMIT_DB, max=GAIN_LIMIT_DB
++            ),
++            cv.Optional(CONF_STEP, default=0.5): cv.positive_float,
++            cv.Optional(CONF_RESTORE_VALUE, default=False): cv.boolean,
++        }
++    )
++    .extend(cv.COMPONENT_SCHEMA),
++    _validate_range,
++)
++
++FINAL_VALIDATE_SCHEMA = final_validate_one_per_hub("number")
++
++
++async def to_code(config: ConfigType) -> None:
++    hub = await cg.get_variable(config[CONF_USB_AUDIO_ID])
++    cg.add(hub.enable_microphone_gain_control())
++    var = await number.new_number(
++        config,
++        min_value=config[CONF_MIN_VALUE],
++        max_value=config[CONF_MAX_VALUE],
++        step=config[CONF_STEP],
++    )
++    await cg.register_component(var, config)
++    await cg.register_parented(var, hub)
++    if config[CONF_RESTORE_VALUE]:
++        cg.add(var.set_restore_value(True))
+diff -ruN a/esphome/components/usb_audio/number/usb_audio_gain_number.cpp b/esphome/components/usb_audio/number/usb_audio_gain_number.cpp
+--- a/esphome/components/usb_audio/number/usb_audio_gain_number.cpp	1970-01-01 01:00:00
++++ b/esphome/components/usb_audio/number/usb_audio_gain_number.cpp	2026-11-24 11:45:56
+@@ -0,0 +1,68 @@
++#include "usb_audio_gain_number.h"
++
++#ifdef USE_USB_AUDIO
++
++#include <algorithm>
++#include <cmath>
++
++#include "esphome/core/log.h"
++
++namespace esphome::usb_audio {
++
++ESPHOME_LOG_TAG(TAG, "usb_audio.number");
++
++// UAC 1.0 volume is a signed 16-bit value in 1/256 dB.
++static constexpr float GAIN_LIMIT_DB = 32767.0f / 256.0f;
++
++void USBAudioGainNumber::setup() {
++  this->parent_->add_on_microphone_gain_callback(
++      [this](const CaptureGainState &state) { this->on_gain_state_(state); });
++  if (!this->restore_value_) {
++    return;
++  }
++  this->pref_ = this->make_entity_preference<float>();
++  float value;
++  if (this->pref_.load(&value) && std::isfinite(value)) {
++    // Overrides the microphone's hardware_gain.
++    this->saved_ = value;
++    this->parent_->request_microphone_gain(static_cast<int16_t>(std::lround(value * 256.0f)));
++    this->publish_state(value);
++  }
++}
++
++void USBAudioGainNumber::dump_config() {
++  LOG_NUMBER("", "USB Audio Gain", this);
++  ESP_LOGCONFIG(TAG, "  Restore value: %s", YESNO(this->restore_value_));
++}
++
++void USBAudioGainNumber::control(float value) {
++  value = std::clamp(value, -GAIN_LIMIT_DB, GAIN_LIMIT_DB);
++  this->parent_->request_microphone_gain(static_cast<int16_t>(std::lround(value * 256.0f)));
++  if (!this->parent_->is_microphone_connected()) {
++    // Nothing reports back until the device connects; show and keep the request meanwhile.
++    this->publish_state(value);
++    this->save_(value);
++  }
++  // Otherwise the worker sets it and the readback publishes the value the device actually took.
++}
++
++void USBAudioGainNumber::on_gain_state_(const CaptureGainState &state) {
++  // Home Assistant picks up a changed range when it next connects; at boot the device usually connects first.
++  this->traits.set_min_value(state.min / 256.0f);
++  this->traits.set_max_value(state.max / 256.0f);
++  this->traits.set_step(state.res / 256.0f);
++  const float value = state.current / 256.0f;
++  this->publish_state(value);
++  this->save_(value);
++}
++
++void USBAudioGainNumber::save_(float value) {
++  if (this->restore_value_ && value != this->saved_) {
++    this->saved_ = value;
++    this->pref_.save(&value);
++  }
++}
++
++}  // namespace esphome::usb_audio
++
++#endif
+diff -ruN a/esphome/components/usb_audio/number/usb_audio_gain_number.h b/esphome/components/usb_audio/number/usb_audio_gain_number.h
+--- a/esphome/components/usb_audio/number/usb_audio_gain_number.h	1970-01-01 01:00:00
++++ b/esphome/components/usb_audio/number/usb_audio_gain_number.h	2026-11-24 11:45:56
+@@ -0,0 +1,38 @@
++#pragma once
++
++#include "esphome/core/defines.h"
++
++#ifdef USE_USB_AUDIO
++
++#include "esphome/components/number/number.h"
++#include "esphome/components/usb_audio/usb_audio.h"
++#include "esphome/core/component.h"
++#include "esphome/core/helpers.h"
++#include "esphome/core/preferences.h"
++
++namespace esphome::usb_audio {
++
++/// The microphone's hardware capture gain in dB, set on every channel. It always shows what the device reports back,
++/// and takes its range and step from the device once it connects.
++class USBAudioGainNumber : public number::Number, public Component, public Parented<USBAudioComponent> {
++ public:
++  void setup() override;
++  void dump_config() override;
++  // After the hub, which it registers with.
++  float get_setup_priority() const override { return setup_priority::DATA; }
++
++  void set_restore_value(bool restore_value) { this->restore_value_ = restore_value; }
++
++ protected:
++  void control(float value) override;
++  void on_gain_state_(const CaptureGainState &state);
++  void save_(float value);
++
++  bool restore_value_{false};
++  ESPPreferenceObject pref_;
++  float saved_{NAN};
++};
++
++}  // namespace esphome::usb_audio
++
++#endif
+diff -ruN a/esphome/components/usb_audio/uac_control.cpp b/esphome/components/usb_audio/uac_control.cpp
+--- a/esphome/components/usb_audio/uac_control.cpp	1970-01-01 01:00:00
++++ b/esphome/components/usb_audio/uac_control.cpp	2026-11-24 11:45:56
+@@ -0,0 +1,356 @@
++#include "uac_control.h"
++
++#ifdef USE_USB_AUDIO
++
++#include <algorithm>
++#include <cinttypes>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++#include "esphome/core/hal.h"
++#include "esphome/core/log.h"
++
++namespace esphome::usb_audio {
++
++ESPHOME_LOG_TAG(TAG, "usb_audio.control");
++
++// Descriptor types and codes from the USB 2.0 and USB Audio Class 1.0 specifications.
++static constexpr uint8_t DESC_INTERFACE = 0x04;
++static constexpr uint8_t DESC_CS_INTERFACE = 0x24;
++static constexpr uint8_t CLASS_AUDIO = 0x01;
++static constexpr uint8_t SUBCLASS_AUDIOCONTROL = 0x01;
++static constexpr uint8_t SUBCLASS_AUDIOSTREAMING = 0x02;
++// Audio Control interface descriptor subtypes.
++static constexpr uint8_t AC_HEADER = 0x01;
++static constexpr uint8_t AC_INPUT_TERMINAL = 0x02;
++static constexpr uint8_t AC_OUTPUT_TERMINAL = 0x03;
++static constexpr uint8_t AC_MIXER_UNIT = 0x04;
++static constexpr uint8_t AC_SELECTOR_UNIT = 0x05;
++static constexpr uint8_t AC_FEATURE_UNIT = 0x06;
++static constexpr uint8_t AC_PROCESSING_UNIT = 0x07;
++static constexpr uint8_t AC_EXTENSION_UNIT = 0x08;
++// Audio Streaming interface descriptor subtype.
++static constexpr uint8_t AS_GENERAL = 0x01;
++// Feature Unit control selectors.
++static constexpr uint8_t FU_MUTE_CONTROL = 0x01;
++static constexpr uint8_t FU_VOLUME_CONTROL = 0x02;
++// bmaControls bits.
++static constexpr uint8_t FU_CONTROL_MUTE = 1 << 0;
++static constexpr uint8_t FU_CONTROL_VOLUME = 1 << 1;
++// Class-specific request to an interface, device to host and host to device.
++static constexpr uint8_t REQUEST_TYPE_CLASS_INTERFACE_IN = 0xA1;
++static constexpr uint8_t REQUEST_TYPE_CLASS_INTERFACE_OUT = 0x21;
++static constexpr uint8_t SET_CUR = 0x01;
++
++static constexpr size_t SETUP_SIZE = sizeof(usb_setup_packet_t);
++static constexpr size_t MAX_DATA_SIZE = 8;
++// Feature Unit requests take a few milliseconds; the driver itself allows 5 s.
++static constexpr uint32_t CONTROL_TIMEOUT_MS = 1000;
++static constexpr uint32_t FLUSH_TIMEOUT_MS = 200;
++// A capture path longer than this is malformed or circular.
++static constexpr uint8_t MAX_PATH_LENGTH = 16;
++// Channel masks are 16 bits wide.
++static constexpr uint8_t MAX_FEATURE_CHANNELS = 16;
++
++static uint16_t read_u16(const uint8_t *p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
++
++const char *format_db(int16_t volume, char *buffer) {
++  const int32_t magnitude = std::abs(static_cast<int32_t>(volume));
++  // Hundredths of a dB, rounded.
++  const int32_t hundredths = (magnitude * 100 + 128) / 256;
++  snprintf(buffer, DB_STR_SIZE, "%c%" PRId32 ".%02" PRId32 " dB", volume < 0 ? '-' : '+', hundredths / 100,
++           hundredths % 100);
++  return buffer;
++}
++
++esp_err_t UACControlSession::open(uint8_t addr) {
++  usb_host_client_config_t config{
++      .is_synchronous = false,
++      .max_num_event_msg = 5,
++      .async = {.client_event_callback = &UACControlSession::client_event_cb, .callback_arg = this}};
++  esp_err_t err = usb_host_client_register(&config, &this->client_);
++  if (err != ESP_OK) {
++    this->client_ = nullptr;
++    return err;
++  }
++  err = usb_host_device_open(this->client_, addr, &this->device_);
++  if (err != ESP_OK) {
++    this->device_ = nullptr;
++    this->close();
++    return err;
++  }
++  err = usb_host_get_active_config_descriptor(this->device_, &this->config_desc_);
++  if (err == ESP_OK) {
++    err = usb_host_transfer_alloc(SETUP_SIZE + MAX_DATA_SIZE, 0, &this->transfer_);
++  }
++  if (err != ESP_OK) {
++    this->transfer_ = nullptr;
++    this->close();
++  }
++  return err;
++}
++
++void UACControlSession::close() {
++  if (this->transfer_stuck_) {
++    // The host stack may still complete the transfer into this memory, and a client with a transfer in flight cannot
++    // close the device or deregister.
++    ESP_LOGE(TAG, "Leaving a stuck control transfer and its USB host client behind");
++    this->client_ = nullptr;
++    this->device_ = nullptr;
++    this->transfer_ = nullptr;
++    return;
++  }
++  if (this->transfer_ != nullptr) {
++    usb_host_transfer_free(this->transfer_);
++    this->transfer_ = nullptr;
++  }
++  if (this->device_ != nullptr) {
++    usb_host_device_close(this->client_, this->device_);
++    this->device_ = nullptr;
++  }
++  this->config_desc_ = nullptr;
++  if (this->client_ != nullptr) {
++    // Deliver what the host library queued for this client (a device gone, a new device) before leaving. One call
++    // handles every pending event; with a zero timeout it always returns ESP_OK, so it must not be looped on.
++    usb_host_client_handle_events(this->client_, 0);
++    esp_err_t err = usb_host_client_deregister(this->client_);
++    if (err != ESP_OK) {
++      ESP_LOGW(TAG, "usb_host_client_deregister failed: %s", esp_err_to_name(err));
++    }
++    this->client_ = nullptr;
++  }
++}
++
++const uint8_t *UACControlSession::find_entity_(const uint8_t *begin, const uint8_t *end, uint8_t id) const {
++  for (const uint8_t *p = begin; p + 4 <= end && p[0] >= 2 && p + p[0] <= end; p += p[0]) {
++    if (p[1] != DESC_CS_INTERFACE || p[2] < AC_INPUT_TERMINAL || p[2] > AC_EXTENSION_UNIT) {
++      continue;
++    }
++    // Terminals and units all carry their ID at offset 3.
++    if (p[3] == id) {
++      return p;
++    }
++  }
++  return nullptr;
++}
++
++bool UACControlSession::find_capture_feature_unit(uint8_t stream_iface, UACFeatureUnit &unit) const {
++  unit = UACFeatureUnit{};
++  unit.stream_iface = stream_iface;
++  if (this->config_desc_ == nullptr) {
++    return false;
++  }
++  const auto *const config = reinterpret_cast<const uint8_t *>(this->config_desc_);
++  const uint8_t *const end = config + this->config_desc_->wTotalLength;
++
++  // The class-specific descriptors that follow the first Audio Control interface, and the terminal link of the
++  // streaming interface.
++  const uint8_t *ac_begin = nullptr;
++  const uint8_t *ac_end = nullptr;
++  bool ac_found = false;
++  bool in_ac = false;
++  bool in_stream = false;
++  for (const uint8_t *p = config; p + 2 <= end && p[0] >= 2 && p + p[0] <= end; p += p[0]) {
++    if (p[1] == DESC_INTERFACE && p[0] >= 9) {
++      if (in_ac) {
++        ac_end = p;
++        in_ac = false;
++      }
++      const bool audio = p[5] == CLASS_AUDIO;
++      if (audio && p[6] == SUBCLASS_AUDIOCONTROL && !ac_found) {
++        ac_found = true;
++        in_ac = true;
++        unit.control_iface = p[2];
++        ac_begin = p + p[0];
++      }
++      in_stream = audio && p[6] == SUBCLASS_AUDIOSTREAMING && p[2] == stream_iface;
++      continue;
++    }
++    if (p[1] != DESC_CS_INTERFACE || p[0] < 3) {
++      continue;
++    }
++    if (in_ac && p[2] == AC_HEADER && p[0] >= 5) {
++      unit.bcd_adc = read_u16(p + 3);
++    } else if (in_stream && p[2] == AS_GENERAL && p[0] >= 4 && unit.stream_terminal_id == 0) {
++      unit.stream_terminal_id = p[3];
++    }
++  }
++  if (in_ac) {
++    ac_end = end;
++  }
++  if (!ac_found || unit.bcd_adc != 0x0100 || unit.stream_terminal_id == 0) {
++    // usb_host_uac only opens UAC 1.0 devices, whose controls this follows.
++    return false;
++  }
++
++  // Walk the capture path back from the streaming terminal; like usb_host_uac, take a mixer's or selector's first input
++  // and the Feature Unit nearest the stream.
++  const uint8_t *entity = this->find_entity_(ac_begin, ac_end, unit.stream_terminal_id);
++  for (uint8_t hops = 0; entity != nullptr && hops < MAX_PATH_LENGTH; hops++) {
++    const uint8_t length = entity[0];
++    uint8_t source = 0;
++    switch (entity[2]) {
++      case AC_INPUT_TERMINAL:
++        if (length >= 6) {
++          unit.input_terminal_id = entity[3];
++          unit.input_terminal_type = read_u16(entity + 4);
++        }
++        return true;
++      case AC_OUTPUT_TERMINAL:
++        source = length >= 8 ? entity[7] : 0;
++        break;
++      case AC_FEATURE_UNIT: {
++        const uint8_t control_size = length >= 6 ? entity[5] : 0;
++        if (unit.unit_id == 0 && control_size != 0 && length >= 7) {
++          unit.unit_id = entity[3];
++          const uint8_t count = std::min<uint8_t>((length - 7) / control_size, MAX_FEATURE_CHANNELS);
++          unit.channels = count > 0 ? count - 1 : 0;
++          for (uint8_t ch = 0; ch < count; ch++) {
++            const uint8_t controls = entity[6 + ch * control_size];
++            if (controls & FU_CONTROL_VOLUME) {
++              unit.volume_channels |= 1 << ch;
++            }
++            if (controls & FU_CONTROL_MUTE) {
++              unit.mute_channels |= 1 << ch;
++            }
++          }
++        }
++        source = length >= 5 ? entity[4] : 0;
++        break;
++      }
++      case AC_MIXER_UNIT:
++      case AC_SELECTOR_UNIT:
++        source = (length >= 6 && entity[4] > 0) ? entity[5] : 0;
++        break;
++      case AC_PROCESSING_UNIT:
++      case AC_EXTENSION_UNIT:
++        source = (length >= 8 && entity[6] > 0) ? entity[7] : 0;
++        break;
++      default:
++        break;
++    }
++    entity = source != 0 ? this->find_entity_(ac_begin, ac_end, source) : nullptr;
++  }
++  return true;
++}
++
++esp_err_t UACControlSession::get_volume(const UACFeatureUnit &unit, uint8_t request, uint8_t channel, int16_t &volume) {
++  uint8_t data[2]{};
++  esp_err_t err = this->get_(unit, request, FU_VOLUME_CONTROL, channel, data, sizeof(data));
++  if (err == ESP_OK) {
++    volume = static_cast<int16_t>(read_u16(data));
++  }
++  return err;
++}
++
++esp_err_t UACControlSession::get_volume_range(const UACFeatureUnit &unit, uint8_t channel, UACVolumeRange &range) {
++  esp_err_t err = this->get_volume(unit, GET_MIN, channel, range.min);
++  if (err == ESP_OK) {
++    err = this->get_volume(unit, GET_MAX, channel, range.max);
++  }
++  if (err == ESP_OK) {
++    err = this->get_volume(unit, GET_RES, channel, range.res);
++  }
++  if (err == ESP_OK && (range.min > range.max || range.res <= 0)) {
++    return ESP_ERR_INVALID_RESPONSE;
++  }
++  return err;
++}
++
++esp_err_t UACControlSession::get_mute(const UACFeatureUnit &unit, uint8_t channel, bool &muted) {
++  uint8_t data = 0;
++  esp_err_t err = this->get_(unit, GET_CUR, FU_MUTE_CONTROL, channel, &data, 1);
++  if (err == ESP_OK) {
++    muted = data != 0;
++  }
++  return err;
++}
++
++esp_err_t UACControlSession::set_volume(const UACFeatureUnit &unit, uint8_t channel, int16_t volume) {
++  uint8_t data[2] = {static_cast<uint8_t>(volume & 0xFF), static_cast<uint8_t>((volume >> 8) & 0xFF)};
++  return this->request_(false, unit, SET_CUR, FU_VOLUME_CONTROL, channel, data, sizeof(data));
++}
++
++esp_err_t UACControlSession::request_(bool in, const UACFeatureUnit &unit, uint8_t request, uint8_t selector,
++                                      uint8_t channel, uint8_t *data, uint16_t length) {
++  if (this->transfer_ == nullptr || this->transfer_stuck_ || length > MAX_DATA_SIZE) {
++    return ESP_ERR_INVALID_STATE;
++  }
++  auto *setup = reinterpret_cast<usb_setup_packet_t *>(this->transfer_->data_buffer);
++  setup->bmRequestType = in ? REQUEST_TYPE_CLASS_INTERFACE_IN : REQUEST_TYPE_CLASS_INTERFACE_OUT;
++  setup->bRequest = request;
++  setup->wValue = static_cast<uint16_t>((selector << 8) | channel);
++  setup->wIndex = static_cast<uint16_t>((unit.unit_id << 8) | unit.control_iface);
++  setup->wLength = length;
++  this->transfer_->num_bytes = static_cast<int>(SETUP_SIZE + length);
++  if (!in) {
++    memcpy(this->transfer_->data_buffer + SETUP_SIZE, data, length);
++  }
++
++  esp_err_t err = this->submit_and_wait_();
++  if (err != ESP_OK) {
++    return err;
++  }
++  if (this->transfer_->actual_num_bytes != static_cast<int>(SETUP_SIZE + length)) {
++    return ESP_ERR_INVALID_SIZE;
++  }
++  if (in) {
++    memcpy(data, this->transfer_->data_buffer + SETUP_SIZE, length);
++  }
++  return ESP_OK;
++}
++
++void UACControlSession::transfer_cb(usb_transfer_t *transfer) {
++  // Runs inside usb_host_client_handle_events() on the calling task.
++  static_cast<UACControlSession *>(transfer->context)->transfer_done_ = true;
++}
++
++bool UACControlSession::wait_(uint32_t timeout_ms) {
++  const uint32_t start = millis();
++  while (!this->transfer_done_) {
++    if (millis() - start >= timeout_ms) {
++      return false;
++    }
++    usb_host_client_handle_events(this->client_, pdMS_TO_TICKS(5));
++  }
++  return true;
++}
++
++esp_err_t UACControlSession::submit_and_wait_() {
++  this->transfer_done_ = false;
++  this->transfer_->device_handle = this->device_;
++  this->transfer_->bEndpointAddress = 0;
++  this->transfer_->callback = &UACControlSession::transfer_cb;
++  this->transfer_->context = this;
++  this->transfer_->timeout_ms = CONTROL_TIMEOUT_MS;
++  esp_err_t err = usb_host_transfer_submit_control(this->client_, this->transfer_);
++  if (err != ESP_OK) {
++    return err;
++  }
++  if (!this->wait_(CONTROL_TIMEOUT_MS)) {
++    // Like usb_host_uac on a control timeout: halt, flush and clear the default pipe, so the transfer comes back.
++    usb_host_endpoint_halt(this->device_, 0);
++    usb_host_endpoint_flush(this->device_, 0);
++    usb_host_endpoint_clear(this->device_, 0);
++    if (!this->wait_(FLUSH_TIMEOUT_MS)) {
++      this->transfer_stuck_ = true;
++    }
++    return ESP_ERR_TIMEOUT;
++  }
++  switch (this->transfer_->status) {
++    case USB_TRANSFER_STATUS_COMPLETED:
++      return ESP_OK;
++    case USB_TRANSFER_STATUS_STALL:
++      // The device refuses the request: it does not support this control or request.
++      return ESP_ERR_NOT_SUPPORTED;
++    case USB_TRANSFER_STATUS_NO_DEVICE:
++      return ESP_ERR_INVALID_STATE;
++    default:
++      return ESP_FAIL;
++  }
++}
++
++}  // namespace esphome::usb_audio
++
++#endif
+diff -ruN a/esphome/components/usb_audio/uac_control.h b/esphome/components/usb_audio/uac_control.h
+--- a/esphome/components/usb_audio/uac_control.h	1970-01-01 01:00:00
++++ b/esphome/components/usb_audio/uac_control.h	2026-11-24 11:45:56
+@@ -0,0 +1,106 @@
++#pragma once
++
++#include "esphome/core/defines.h"
++
++#ifdef USE_USB_AUDIO
++
++#include <cstddef>
++#include <cstdint>
++
++extern "C" {
++#include "esp_err.h"
++#include "usb/usb_host.h"
++}
++
++namespace esphome::usb_audio {
++
++/// The Feature Unit on the capture path of one audio streaming interface, as the device's UAC 1.0 descriptors
++/// describe it. Channel 0 is the master channel, 1..channels the logical channels.
++struct UACFeatureUnit {
++  uint16_t bcd_adc{0};
++  uint8_t control_iface{0};
++  uint8_t stream_iface{0};
++  // The terminal the streaming interface links to (bTerminalLink), the USB streaming Output Terminal for capture.
++  uint8_t stream_terminal_id{0};
++  // The Input Terminal the capture path starts at, 0 when the path does not lead to one.
++  uint8_t input_terminal_id{0};
++  uint16_t input_terminal_type{0};
++  // 0 when there is no Feature Unit on the path.
++  uint8_t unit_id{0};
++  uint8_t channels{0};
++  uint16_t volume_channels{0};
++  uint16_t mute_channels{0};
++
++  bool has_volume(uint8_t channel) const { return (this->volume_channels >> channel) & 1; }
++  bool has_mute(uint8_t channel) const { return (this->mute_channels >> channel) & 1; }
++};
++
++/// Volume range of one Feature Unit channel, in 1/256 dB like every UAC 1.0 volume value.
++struct UACVolumeRange {
++  int16_t min{0};
++  int16_t max{0};
++  int16_t res{0};
++};
++
++/// A short-lived USB host client of its own that reads a UAC 1.0 device's Audio Control descriptors and sends Feature
++/// Unit requests on the device's default pipe, for what usb_host_uac does not expose: the Feature Unit and its
++/// channels, the volume range and per-channel readback.
++///
++/// Every call blocks until the device answers, so it runs on the hub's worker only, while the worker holds the driver.
++class UACControlSession {
++ public:
++  UACControlSession() = default;
++  ~UACControlSession() { this->close(); }
++  UACControlSession(const UACControlSession &) = delete;
++  UACControlSession &operator=(const UACControlSession &) = delete;
++
++  esp_err_t open(uint8_t addr);
++  void close();
++
++  /// Fills `unit` for the capture path of streaming interface `stream_iface`; false when the descriptors have no UAC
++  /// 1.0 Audio Control interface or no terminal link for it. `unit.unit_id` stays 0 when the path has no Feature Unit.
++  bool find_capture_feature_unit(uint8_t stream_iface, UACFeatureUnit &unit) const;
++
++  /// `request` is one of the GET_* request codes below.
++  esp_err_t get_volume(const UACFeatureUnit &unit, uint8_t request, uint8_t channel, int16_t &volume);
++  esp_err_t get_volume_range(const UACFeatureUnit &unit, uint8_t channel, UACVolumeRange &range);
++  esp_err_t get_mute(const UACFeatureUnit &unit, uint8_t channel, bool &muted);
++  /// SET_CUR of one channel's volume, in 1/256 dB.
++  esp_err_t set_volume(const UACFeatureUnit &unit, uint8_t channel, int16_t volume);
++
++  static constexpr uint8_t GET_CUR = 0x81;
++  static constexpr uint8_t GET_MIN = 0x82;
++  static constexpr uint8_t GET_MAX = 0x83;
++  static constexpr uint8_t GET_RES = 0x84;
++
++ protected:
++  esp_err_t get_(const UACFeatureUnit &unit, uint8_t request, uint8_t selector, uint8_t channel, uint8_t *data,
++                 uint16_t length) {
++    return this->request_(true, unit, request, selector, channel, data, length);
++  }
++  esp_err_t request_(bool in, const UACFeatureUnit &unit, uint8_t request, uint8_t selector, uint8_t channel,
++                     uint8_t *data, uint16_t length);
++  esp_err_t submit_and_wait_();
++  bool wait_(uint32_t timeout_ms);
++  const uint8_t *find_entity_(const uint8_t *begin, const uint8_t *end, uint8_t id) const;
++
++  static void transfer_cb(usb_transfer_t *transfer);
++  static void client_event_cb(const usb_host_client_event_msg_t *event_msg, void *arg) {}
++
++  usb_host_client_handle_t client_{nullptr};
++  usb_device_handle_t device_{nullptr};
++  usb_transfer_t *transfer_{nullptr};
++  const usb_config_desc_t *config_desc_{nullptr};
++  bool transfer_done_{false};
++  // A transfer the host stack never returned; its memory and the client are left alone.
++  bool transfer_stuck_{false};
++};
++
++/// Formats a 1/256 dB value as "+10.50 dB" into `buffer`, which holds at least DB_STR_SIZE bytes, without using float
++/// formatting on the worker's small stack.
++static constexpr size_t DB_STR_SIZE = 16;
++const char *format_db(int16_t volume, char *buffer);
++
++}  // namespace esphome::usb_audio
++
++#endif
+diff -ruN a/esphome/components/usb_audio/usb_audio.cpp b/esphome/components/usb_audio/usb_audio.cpp
+--- a/esphome/components/usb_audio/usb_audio.cpp	2026-11-24 11:45:56
++++ b/esphome/components/usb_audio/usb_audio.cpp	2026-11-24 11:45:56
+@@ -10,6 +10,8 @@
+ #include "esphome/core/hal.h"
+ #include "esphome/core/log.h"
+ 
++#include "uac_control.h"
++
+ extern "C" {
+ #include "esp_err.h"
+ }
+@@ -48,6 +50,31 @@
+   return std::find(alt.sample_freq, alt.sample_freq + count, sample_rate) != alt.sample_freq + count;
+ }
+ 
++static void log_alt_settings(uac_host_device_handle_t handle, uint8_t alt_num) {
++  for (uint8_t alt = 1; alt <= alt_num; alt++) {
++    uac_host_dev_alt_param_t alt_param{};
++    if (uac_host_get_device_alt_param(handle, alt, &alt_param) != ESP_OK) {
++      continue;
++    }
++    if (alt_param.sample_freq_type == 0) {
++      ESP_LOGI(TAG, "  alt %u: channels=%u bits=%u subframe=%u bytes sample rate range=%" PRIu32 "-%" PRIu32 " Hz", alt,
++               alt_param.channels, alt_param.bit_resolution, alt_param.subframe_size, alt_param.sample_freq_lower,
++               alt_param.sample_freq_upper);
++      continue;
++    }
++    ESP_LOGI(TAG, "  alt %u: channels=%u bits=%u subframe=%u bytes sample rates:", alt, alt_param.channels,
++             alt_param.bit_resolution, alt_param.subframe_size);
++    const uint8_t count = discrete_rate_count(alt_param);
++    for (uint8_t i = 0; i < count; i++) {
++      // Some devices list a rate more than once.
++      if (std::find(alt_param.sample_freq, alt_param.sample_freq + i, alt_param.sample_freq[i]) ==
++          alt_param.sample_freq + i) {
++        ESP_LOGI(TAG, "    %" PRIu32 " Hz", alt_param.sample_freq[i]);
++      }
++    }
++  }
++}
++
+ void USBAudioComponent::setup() {
+   this->event_queue_ = xQueueCreateStatic(EVENT_QUEUE_LENGTH, sizeof(USBAudioEvent), this->event_queue_storage_.data(),
+                                           &this->event_queue_struct_);
+@@ -296,6 +323,15 @@
+     case USBAudioEvent::Type::CLOSED:
+       this->on_closed_(event, now);
+       break;
++    case USBAudioEvent::Type::GAIN: {
++      CaptureGainState state;
++      {
++        LockGuard lock(this->gain_lock_);
++        state = this->gain_state_;
++      }
++      this->gain_callbacks_.call(state);
++      break;
++    }
+   }
+ }
+ 
+@@ -378,6 +414,10 @@
+     this->handle_disconnect_(event.handle);
+     return;
+   }
++  if (event.endpoint == Endpoint::MICROPHONE && this->gain_pending_) {
++    // A gain request arrived after the open had read the requests, while the handle was not published yet.
++    this->queue_gain_op_();
++  }
+   // The device that was being opened is still here, so a connect deferred meanwhile was a duplicate.
+   ep.connect_deferred = false;
+   if (ep.active) {
+@@ -631,6 +671,10 @@
+       esp_err_t err = uac_host_device_open(&dev_cfg, &handle);
+       if (err != ESP_OK) {
+         ESP_LOGE(TAG, "Failed to open %s interface: %s", LOG_STR_ARG(name), esp_err_to_name(err));
++      } else if (op.endpoint == Endpoint::MICROPHONE && this->gain_control_) {
++        this->log_capture_controls_(handle);
++        // Set it as soon as the device is here, so the gain number shows the real value before any stream.
++        this->sync_microphone_gain_(handle, true);
+       }
+       result.type = USBAudioEvent::Type::OPENED;
+       result.ok = err == ESP_OK;
+@@ -644,7 +688,19 @@
+       result.type = USBAudioEvent::Type::STARTED;
+       uac_host_stream_config_t stm_cfg{};
+       if (this->populate_stream_config_(op.endpoint, op.handle, stm_cfg, result.rejected)) {
++        // The driver only takes volume requests once the stream is started, so a configured capture gain starts it
++        // suspended, sets the gain and then lets the audio flow.
++        const bool set_gain = op.endpoint == Endpoint::MICROPHONE && this->gain_control_;
++        if (set_gain) {
++          stm_cfg.flags |= FLAG_STREAM_SUSPEND_AFTER_START;
++        }
+         esp_err_t err = uac_host_device_start(op.handle, &stm_cfg);
++        if (set_gain && err == ESP_OK) {
++          this->sync_microphone_gain_(op.handle, false);
++          ESP_LOGD(TAG, "Starting USB Audio capture");
++          // Already active is ESP_OK.
++          err = uac_host_device_resume(op.handle);
++        }
+         // Already started or active is ESP_OK; ESP_ERR_INVALID_STATE means the interface is not ready.
+         result.ok = err == ESP_OK;
+         // The host cannot allocate the endpoint's pipe, for example when its max packet size exceeds the USB FIFO.
+@@ -701,6 +757,16 @@
+       this->post_event_(result);
+       return;
+     }
++    case Op::Type::GAIN: {
++      // Cleared first, so a request made during the transfers queues another op.
++      this->gain_queued_ = false;
++      const uac_host_device_handle_t handle = this->endpoint_(Endpoint::MICROPHONE).handle;
++      if (handle != nullptr) {
++        this->sync_microphone_gain_(handle, false);
++      }
++      // Otherwise gain_pending_ stays set and the next open sends it.
++      return;
++    }
+     case Op::Type::CONTROLS: {
+       // Cleared first, so a change made during the transfer queues another op.
+       this->controls_queued_ = false;
+@@ -765,29 +831,239 @@
+   }
+   ESP_LOGW(TAG, "%s interface %u does not support requested format (channels=%u bits=%u sample_rate=%" PRIu32 " Hz)",
+            LOG_STR_ARG(name), dev_info.iface_num, channels, bits, sample_rate);
+-  for (uint8_t alt = 1; alt <= dev_info.iface_alt_num; alt++) {
+-    uac_host_dev_alt_param_t alt_param{};
+-    if (uac_host_get_device_alt_param(handle, alt, &alt_param) != ESP_OK) {
++  log_alt_settings(handle, dev_info.iface_alt_num);
++  return false;
++}
++
++static const LogString *terminal_type_name(uint16_t type) {
++  switch (type) {
++    case 0x0201:
++      return LOG_STR("microphone");
++    case 0x0600:
++    case 0x0601:
++    case 0x0603:
++      return LOG_STR("analog connector");
++    case 0x0602:
++      return LOG_STR("digital audio interface");
++    case 0x0605:
++      return LOG_STR("S/PDIF");
++    default:
++      return LOG_STR("other");
++  }
++}
++
++// The worker logs this once per microphone open, so a device's capture controls are visible before anything is set.
++void USBAudioComponent::log_capture_controls_(uac_host_device_handle_t handle) {
++  uac_host_dev_info_t info{};
++  if (uac_host_get_device_info(handle, &info) != ESP_OK) {
++    return;
++  }
++  // One line per message: the worker's logs pass through the logger's small task buffer, which drops long ones.
++  ESP_LOGI(TAG, "USB Audio Capture Device connected");
++  ESP_LOGI(TAG, "  VID: 0x%04X, PID: 0x%04X", info.VID, info.PID);
++  ESP_LOGI(TAG, "  Address: %u, streaming interface: %u", info.addr, info.iface_num);
++  log_alt_settings(handle, info.iface_alt_num);
++
++  UACControlSession session;
++  esp_err_t err = session.open(info.addr);
++  if (err != ESP_OK) {
++    ESP_LOGW(TAG, "Cannot read the capture controls: %s", esp_err_to_name(err));
++    return;
++  }
++  UACFeatureUnit unit;
++  if (!session.find_capture_feature_unit(info.iface_num, unit)) {
++    ESP_LOGW(TAG, "  No UAC 1.0 capture path found in the descriptors");
++    return;
++  }
++  ESP_LOGI(TAG, "  UAC version: %X.%02X", unit.bcd_adc >> 8, unit.bcd_adc & 0xFF);
++  ESP_LOGI(TAG, "  Audio Control interface: %u", unit.control_iface);
++  ESP_LOGI(TAG, "  Capture path: Input Terminal %u (type 0x%04X, %s) -> Feature Unit %u -> streaming terminal %u",
++           unit.input_terminal_id, unit.input_terminal_type, LOG_STR_ARG(terminal_type_name(unit.input_terminal_type)),
++           unit.unit_id, unit.stream_terminal_id);
++  if (unit.unit_id == 0) {
++    ESP_LOGI(TAG, "  Capture Feature Unit: none (no hardware gain or mute)");
++    return;
++  }
++  ESP_LOGI(TAG, "  Capture Feature Unit: %u, logical channels: %u", unit.unit_id, unit.channels);
++  ESP_LOGI(TAG, "  Volume controls: 0x%04X, mute controls: 0x%04X (bit 0 = master)", unit.volume_channels,
++           unit.mute_channels);
++  for (uint8_t ch = 0; ch <= unit.channels; ch++) {
++    char cur_str[DB_STR_SIZE];
++    char min_str[DB_STR_SIZE];
++    char max_str[DB_STR_SIZE];
++    char res_str[DB_STR_SIZE];
++    char label[12];
++    if (ch == 0) {
++      snprintf(label, sizeof(label), "Master");
++    } else {
++      snprintf(label, sizeof(label), "Channel %u", ch);
++    }
++    if (unit.has_volume(ch)) {
++      int16_t cur = 0;
++      UACVolumeRange range;
++      esp_err_t cur_err = session.get_volume(unit, UACControlSession::GET_CUR, ch, cur);
++      esp_err_t range_err = session.get_volume_range(unit, ch, range);
++      if (cur_err == ESP_OK) {
++        ESP_LOGI(TAG, "  %s gain: %s", label, format_db(cur, cur_str));
++      } else {
++        ESP_LOGW(TAG, "  %s gain: GET_CUR failed: %s", label, esp_err_to_name(cur_err));
++      }
++      if (range_err == ESP_OK) {
++        ESP_LOGI(TAG, "  %s minimum gain: %s, maximum gain: %s, gain resolution: %s", label,
++                 format_db(range.min, min_str), format_db(range.max, max_str), format_db(range.res, res_str));
++      } else {
++        ESP_LOGW(TAG, "  %s gain range: GET_MIN/MAX/RES failed: %s", label, esp_err_to_name(range_err));
++      }
++    }
++    if (unit.has_mute(ch)) {
++      bool muted = false;
++      esp_err_t mute_err = session.get_mute(unit, ch, muted);
++      if (mute_err == ESP_OK) {
++        ESP_LOGI(TAG, "  %s mute: %s", label, ONOFF(muted));
++      } else {
++        ESP_LOGW(TAG, "  %s mute: GET_CUR failed: %s", label, esp_err_to_name(mute_err));
++      }
++    }
++  }
++}
++
++// Snap a gain onto the device's grid: min + n * res, within [min, max].
++static int16_t snap_gain(int32_t gain, const UACVolumeRange &range) {
++  int32_t value = std::clamp<int32_t>(gain, range.min, range.max);
++  const int32_t steps = (value - range.min + range.res / 2) / range.res;
++  value = range.min + steps * range.res;
++  if (value > range.max) {
++    value -= range.res;
++  }
++  return static_cast<int16_t>(value);
++}
++
++void USBAudioComponent::sync_microphone_gain_(uac_host_device_handle_t handle, bool verbose) {
++  char db_str[DB_STR_SIZE];
++  char db_str2[DB_STR_SIZE];
++  // Cleared before the transfers: a request made meanwhile sets it again and queues another sync.
++  this->gain_pending_ = false;
++  const int32_t want = this->gain_request_;
++  const char *failure = want != NO_GAIN ? "Hardware capture gain not set" : "Hardware capture gain not read";
++
++  uac_host_dev_info_t info{};
++  esp_err_t err = uac_host_get_device_info(handle, &info);
++  if (err != ESP_OK) {
++    ESP_LOGE(TAG, "%s: device info unavailable: %s", failure, esp_err_to_name(err));
++    return;
++  }
++  UACControlSession session;
++  err = session.open(info.addr);
++  if (err != ESP_OK) {
++    ESP_LOGE(TAG, "%s: cannot reach the device's controls: %s", failure, esp_err_to_name(err));
++    return;
++  }
++  UACFeatureUnit unit;
++  if (!session.find_capture_feature_unit(info.iface_num, unit) || unit.unit_id == 0 || unit.volume_channels == 0) {
++    ESP_LOGE(TAG, "%s: the device has no volume control on its capture path", failure);
++    return;
++  }
++
++  CaptureGainState state;
++  // The channel `state` describes: the first logical channel read, or the master channel.
++  bool state_from_channel = false;
++  bool state_set = false;
++  bool sent = false;
++  bool confirmed = true;
++  for (uint8_t ch = 0; ch <= unit.channels; ch++) {
++    if (!unit.has_volume(ch)) {
+       continue;
+     }
+-    if (alt_param.sample_freq_type == 0) {
+-      ESP_LOGI(TAG, "  alt %u: channels=%u bits=%u subframe=%u bytes sample rate range=%" PRIu32 "-%" PRIu32 " Hz", alt,
+-               alt_param.channels, alt_param.bit_resolution, alt_param.subframe_size, alt_param.sample_freq_lower,
+-               alt_param.sample_freq_upper);
++    const char *label = ch == 0 ? "Master" : "Channel";
++    UACVolumeRange range;
++    err = session.get_volume_range(unit, ch, range);
++    int16_t current = 0;
++    if (err == ESP_OK) {
++      err = session.get_volume(unit, UACControlSession::GET_CUR, ch, current);
++    }
++    if (err != ESP_OK) {
++      ESP_LOGE(TAG, "%s: %s %u gain cannot be read: %s", failure, label, ch, esp_err_to_name(err));
++      confirmed = false;
+       continue;
+     }
+-    ESP_LOGI(TAG, "  alt %u: channels=%u bits=%u subframe=%u bytes sample rates:", alt, alt_param.channels,
+-             alt_param.bit_resolution, alt_param.subframe_size);
+-    const uint8_t count = discrete_rate_count(alt_param);
+-    for (uint8_t i = 0; i < count; i++) {
+-      // Some devices list a rate more than once.
+-      if (std::find(alt_param.sample_freq, alt_param.sample_freq + i, alt_param.sample_freq[i]) ==
+-          alt_param.sample_freq + i) {
+-        ESP_LOGI(TAG, "    %" PRIu32 " Hz", alt_param.sample_freq[i]);
++    if (verbose) {
++      ESP_LOGI(TAG, "USB Audio capture gain before (%s %u): %s", label, ch, format_db(current, db_str));
++    }
++
++    // Like usb_host_uac, every channel with a volume control (the master channel too) takes the same value.
++    if (want != NO_GAIN) {
++      const int16_t target = snap_gain(want, range);
++      if (target != want) {
++        char min_str[DB_STR_SIZE];
++        char max_str[DB_STR_SIZE];
++        ESP_LOGW(TAG, "%s %u: %s is not supported by the device (%s to %s, steps of %s), using %s", label, ch,
++                 format_db(static_cast<int16_t>(want), db_str), format_db(range.min, min_str),
++                 format_db(range.max, max_str), format_db(range.res, db_str2), format_db(target, db_str));
+       }
++      ESP_LOGI(TAG, "Setting %s %u capture gain to %s", label, ch, format_db(target, db_str));
++      sent = true;
++      err = session.set_volume(unit, ch, target);
++      if (err == ESP_OK) {
++        err = session.get_volume(unit, UACControlSession::GET_CUR, ch, current);
++      }
++      if (err != ESP_OK) {
++        ESP_LOGE(TAG, "%s: %s %u SET_CUR or readback failed: %s", failure, label, ch, esp_err_to_name(err));
++        confirmed = false;
++        continue;
++      }
++      ESP_LOGI(TAG, "%s %u gain readback: %s", label, ch, format_db(current, db_str));
++      // Within half a step of the target.
++      if (std::abs(static_cast<int32_t>(current) - target) * 2 > range.res) {
++        ESP_LOGE(TAG, "%s %u reports %s instead of %s", label, ch, format_db(current, db_str),
++                 format_db(target, db_str2));
++        confirmed = false;
++      }
+     }
++    if (!state_set || (ch > 0 && !state_from_channel)) {
++      state = CaptureGainState{current, range.min, range.max, range.res};
++      state_set = true;
++      state_from_channel = ch > 0;
++    }
+   }
+-  return false;
++  if (sent) {
++    if (confirmed) {
++      ESP_LOGI(TAG, "Hardware capture gain successfully configured");
++    } else {
++      ESP_LOGE(TAG, "Hardware capture gain could not be confirmed by readback");
++    }
++  }
++
++  if (!state_set) {
++    return;
++  }
++  {
++    LockGuard lock(this->gain_lock_);
++    this->gain_state_ = state;
++  }
++  USBAudioEvent event;
++  event.type = USBAudioEvent::Type::GAIN;
++  event.endpoint = Endpoint::MICROPHONE;
++  this->post_event_(event);
++}
++
++void USBAudioComponent::request_microphone_gain(int16_t gain) {
++  this->gain_request_ = gain;
++  this->gain_pending_ = true;
++  this->queue_gain_op_();
++}
++
++void USBAudioComponent::queue_gain_op_() {
++  if (this->op_queue_ == nullptr || this->gain_queued_.exchange(true)) {
++    // Not set up yet, or the queued op will send the latest request.
++    return;
++  }
++  Op op;
++  op.type = Op::Type::GAIN;
++  op.endpoint = Endpoint::MICROPHONE;
++  if (xQueueSend(this->op_queue_, &op, 0) != pdTRUE) {
++    // gain_pending_ stays set, so the next connect or request queues it again.
++    this->gain_queued_ = false;
++  }
+ }
+ 
+ bool USBAudioComponent::apply_pending_speaker_controls_() {
+diff -ruN a/esphome/components/usb_audio/usb_audio.h b/esphome/components/usb_audio/usb_audio.h
+--- a/esphome/components/usb_audio/usb_audio.h	2026-11-24 11:45:56
++++ b/esphome/components/usb_audio/usb_audio.h	2026-11-24 11:45:56
+@@ -9,6 +9,7 @@
+ 
+ #include "esphome/components/audio/audio.h"
+ #include "esphome/core/component.h"
++#include "esphome/core/helpers.h"
+ #include "esphome/core/static_task.h"
+ 
+ extern "C" {
+@@ -35,6 +36,15 @@
+   FAILED,
+ };
+ 
++/// The microphone's hardware capture gain as last read back from the device, in 1/256 dB: that of the first logical
++/// channel with a volume control, or of the master channel when only that one has one.
++struct CaptureGainState {
++  int16_t current{0};
++  int16_t min{0};
++  int16_t max{0};
++  int16_t res{0};
++};
++
+ /// A speaker or microphone platform that streams through the hub. The hub calls it on the main loop only.
+ class USBAudioStream {
+  public:
+@@ -65,6 +75,8 @@
+     STARTED,
+     RESUMED,
+     CLOSED,
++    // The worker read the microphone's capture gain; see USBAudioComponent::gain_state_.
++    GAIN,
+   };
+ 
+   uac_host_device_handle_t handle{nullptr};
+@@ -100,6 +112,29 @@
+   void set_speaker_volume_level(float volume);
+   void set_speaker_mute_state(bool mute_state);
+ 
++  /// Capture gain in 1/256 dB that the worker sets on every channel of the microphone's Feature Unit when the device
++  /// connects and each time its stream starts, before any audio flows. Set before setup().
++  void set_microphone_hardware_gain(int16_t gain) {
++    this->microphone_gain_ = gain;
++    this->microphone_gain_configured_ = true;
++    this->gain_control_ = true;
++    this->gain_request_ = gain;
++  }
++  bool has_microphone_hardware_gain() const { return this->microphone_gain_configured_; }
++  int16_t get_microphone_hardware_gain() const { return this->microphone_gain_; }
++
++  /// A gain number entity exists: read the capture gain back and report it even without a configured gain. Set before
++  /// setup().
++  void enable_microphone_gain_control() { this->gain_control_ = true; }
++  /// Safe from any task. Set every channel of the microphone's capture Feature Unit to `gain` (1/256 dB). The worker
++  /// sends it now when the device is connected, and again on each connect and stream start.
++  void request_microphone_gain(int16_t gain);
++  /// Called on the main loop each time the worker has read the capture gain back.
++  template<typename F> void add_on_microphone_gain_callback(F &&callback) {
++    this->gain_callbacks_.add(std::forward<F>(callback));
++  }
++  bool is_microphone_connected() const { return this->endpoint_(Endpoint::MICROPHONE).handle.load() != nullptr; }
++
+   // Safe from any task. While the worker holds the driver for a control transfer, these wait for it within timeout_ms
+   // and return ESP_ERR_TIMEOUT if it is still busy, instead of blocking on the driver's interface lock for seconds.
+   esp_err_t read_microphone(uint8_t *buffer, size_t size, size_t *bytes_read, uint32_t timeout_ms);
+@@ -158,6 +193,8 @@
+       SUSPEND,
+       CLOSE,
+       CONTROLS,
++      // Send the requested capture gain to the connected microphone.
++      GAIN,
+     };
+ 
+     uac_host_device_handle_t handle{nullptr};
+@@ -203,6 +240,12 @@
+   /// Send pending volume and mute; returns true when one should be retried later.
+   bool apply_pending_speaker_controls_();
+   bool apply_control_(ControlState &control, esp_err_t err, const LogString *name);
++  /// Worker side: log the capture Feature Unit of a newly opened microphone interface.
++  void log_capture_controls_(uac_host_device_handle_t handle);
++  /// Worker side: send the requested capture gain to the microphone (if any), read every channel back and report it.
++  /// `verbose` also logs the gain found before setting it.
++  void sync_microphone_gain_(uac_host_device_handle_t handle, bool verbose);
++  void queue_gain_op_();
+ 
+   static void driver_event_stub(uint8_t addr, uint8_t iface_num, uac_host_driver_event_t event, void *user_data);
+   static void device_event_stub(uac_host_device_handle_t handle, uac_host_device_event_t event, void *user_data);
+@@ -232,6 +275,20 @@
+   std::atomic<bool> driver_busy_{false};
+   std::atomic<uint8_t> driver_users_{0};
+   bool uac_installed_{false};
++  int16_t microphone_gain_{0};
++  bool microphone_gain_configured_{false};
++  // hardware_gain is configured or a gain number exists.
++  bool gain_control_{false};
++  static constexpr int32_t NO_GAIN = INT32_MIN;
++  // The gain to set on every channel, or NO_GAIN to leave the device's own.
++  std::atomic<int32_t> gain_request_{NO_GAIN};
++  // Guards gain_state_, written by the worker and read on the main loop.
++  Mutex gain_lock_;
++  CaptureGainState gain_state_{};
++  // A request the worker has not sent to a connected device yet.
++  std::atomic<bool> gain_pending_{false};
++  std::atomic<bool> gain_queued_{false};
++  CallbackManager<void(const CaptureGainState &)> gain_callbacks_;
+ };
+ 
+ }  // namespace esphome::usb_audio

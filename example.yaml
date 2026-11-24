@@ -1,0 +1,46 @@
+# Example: a USB audio interface or USB turntable as an ESPHome microphone, with its
+# hardware capture gain set to 0 dB and adjustable from Home Assistant.
+esphome:
+  name: usb-audio-gain-example
+
+external_components:
+  - source: github://ChrisMisker/esphome-usb-audio-gain@v0.1.0
+    components: [usb_audio]
+
+esp32:
+  # Any variant with USB OTG host support (ESP32-S2, ESP32-S3, ESP32-P4).
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+
+logger:
+  # Keep the native USB port free for the USB audio device.
+  hardware_uart: UART0
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+
+usb_audio:
+  id: usb_audio_hub
+
+microphone:
+  - platform: usb_audio
+    id: usb_mic
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    num_channels: 2
+    # Set on the device's Feature Unit when it connects and before each stream starts.
+    hardware_gain: 0dB
+
+number:
+  - platform: usb_audio
+    id: usb_input_gain
+    name: "USB Input Gain"
+    # Keep the last value set from Home Assistant across reboots; it then wins over hardware_gain.
+    restore_value: true
